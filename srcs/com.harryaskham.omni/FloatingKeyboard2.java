@@ -976,21 +976,52 @@ public class FloatingKeyboard2 extends InputMethodService
 
   private android.graphics.Point getFullDisplaySize() {
     android.graphics.Point size = new android.graphics.Point();
-    // bd-6aacf2: use the display-aware overlay WindowManager so getMaximumWindowMetrics
-    // reports the spanned (combined) bounds on a multi-display device, not one half.
+    // bd-6aacf2 (v59, Harry: "just like one big screen"): return the TRUE spanned
+    // bounds so the keyboard can be dragged onto either half and stretched across
+    // both. Three sources are consulted and the WIDEST reliable one wins (the
+    // spanned display is the widest):
+    //  - Jetpack androidx.window WindowMetricsCalculator.computeMaximumWindowMetrics:
+    //    the foldable-aware max window size; on a Surface Duo this is the combined
+    //    span (~2700w) even where the platform API under-reports one half. This is
+    //    the fix for the v57/v58 failure where the overlay stayed pinned to one
+    //    screen.
+    //  - the platform getMaximumWindowMetrics on the display-aware overlay WM.
+    //  - getResources().getDisplayMetrics() as a single-screen floor.
+    // All three are logged so ONE on-device capture pins any residual discrepancy.
+    // On a normal single-screen phone all three agree, so behaviour is unchanged.
+    DisplayMetrics rdm = getResources().getDisplayMetrics();
+    int jetpackW = 0, jetpackH = 0;
+    try {
+      android.content.Context uiCtx = (_overlayWindowContext != null)
+          ? _overlayWindowContext : this;
+      android.graphics.Rect jb = androidx.window.layout.WindowMetricsCalculator
+          .getOrCreate().computeMaximumWindowMetrics(uiCtx).getBounds();
+      jetpackW = jb.width(); jetpackH = jb.height();
+    } catch (Throwable t) {
+      Logs.log("FloatingKeyboard2", "WindowMetricsCalculator unavailable: " + t);
+    }
+    int platformW = 0, platformH = 0;
     WindowManager wm = (_windowManager != null) ? _windowManager
         : getSystemService(WindowManager.class);
-    if (wm == null) {
-      DisplayMetrics dm = getResources().getDisplayMetrics();
-      size.set(dm.widthPixels, dm.heightPixels);
-      return size;
+    if (wm != null && android.os.Build.VERSION.SDK_INT >= 30) {
+      try {
+        android.graphics.Rect pb = wm.getMaximumWindowMetrics().getBounds();
+        platformW = pb.width(); platformH = pb.height();
+      } catch (Throwable ignore) {}
+    } else if (wm != null) {
+      try {
+        android.graphics.Point rp = new android.graphics.Point();
+        wm.getDefaultDisplay().getRealSize(rp);
+        platformW = rp.x; platformH = rp.y;
+      } catch (Throwable ignore) {}
     }
-    if (android.os.Build.VERSION.SDK_INT >= 30) {
-      android.graphics.Rect bounds = wm.getMaximumWindowMetrics().getBounds();
-      size.set(bounds.width(), bounds.height());
-    } else {
-      wm.getDefaultDisplay().getRealSize(size);
-    }
+    int w = Math.max(Math.max(jetpackW, platformW), rdm.widthPixels);
+    int h = Math.max(Math.max(jetpackH, platformH), rdm.heightPixels);
+    Logs.log("FloatingKeyboard2", "display sources: jetpack=" + jetpackW + "x" + jetpackH
+        + " platform=" + platformW + "x" + platformH
+        + " resources=" + rdm.widthPixels + "x" + rdm.heightPixels
+        + " -> using " + w + "x" + h);
+    size.set(w, h);
     return size;
   }
 
@@ -1056,12 +1087,17 @@ public class FloatingKeyboard2 extends InputMethodService
     // hinge crossing is intentional). Geometry is logged for on-device tuning.
     if (_foldStateTracker != null) {
       android.graphics.Rect hinge = _foldStateTracker.getSeparatingHingeBounds();
-      if (hinge != null && hinge.width() < hinge.height()) { // vertical hinge (left/right)
-        int before = clampedX;
-        clampedX = hingeAvoidedX(clampedX, keyboardWidth, screenWidth, hinge.left, hinge.right);
-        Logs.log("FloatingKeyboard2", "hinge gap=" + hinge.left + ".." + hinge.right
-            + " kb=" + before + ".." + (before + keyboardWidth)
-            + (clampedX != before ? " -> x=" + clampedX : " (spanning/clear, no snap)"));
+      if (hinge != null) {
+        // bd-6aacf2 (v59, Harry: "just like one big screen"): do NOT snap the
+        // keyboard out of the hinge. v58's hinge-avoidance snap shoved a
+        // one-side-fitting keyboard back onto one half, which read as "stuck on
+        // screen one". Treat both halves as a single canvas: the keyboard is free
+        // to sit on either screen or straddle the hinge. hingeAvoidedX is retained
+        // (unit-tested) but intentionally no longer applied to the live clamp.
+        // Hinge geometry is logged for reference only.
+        Logs.log("FloatingKeyboard2", "hinge present gap=" + hinge.left + ".." + hinge.right
+            + " kb=" + clampedX + ".." + (clampedX + keyboardWidth)
+            + " (one-big-screen: no snap)");
       }
     }
 
