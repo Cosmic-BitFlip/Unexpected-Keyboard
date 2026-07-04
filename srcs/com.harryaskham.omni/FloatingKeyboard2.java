@@ -93,6 +93,21 @@ public class FloatingKeyboard2 extends InputMethodService
   private View _floatingKeyboardView;
   private WindowManager.LayoutParams _floatingLayoutParams;
   private ViewGroup _floatingContainer;
+
+  // bd-6aacf2 (v60): a mirrored second floating keyboard placed on a secondary
+  // physical display (e.g. the other half of a Surface Duo). A single
+  // TYPE_APPLICATION_OVERLAY window is pinned to one display and cannot cross the
+  // hinge (the v55/v57/v59 metric fixes all failed on this), so we render an
+  // independent keyboard window on each additional screen. Both Keyboard2Views
+  // share the global Config + KeyEventHandler, so a tap on either screen types
+  // into the same focused field. Null / inactive on single-display devices, where
+  // findSecondaryDisplay() returns null, so normal phones are unaffected.
+  private WindowManager _secondaryWindowManager;
+  private android.content.Context _secondaryOverlayWindowContext;
+  private View _secondaryFloatingKeyboardView;
+  private ViewGroup _secondaryFloatingContainer;
+  private WindowManager.LayoutParams _secondaryFloatingLayoutParams;
+  private boolean _secondaryKeyboardActive = false;
   
   // Separate window for toggle button to remain touchable in passthrough mode
   private View _toggleButtonWindow;
@@ -135,6 +150,9 @@ public class FloatingKeyboard2 extends InputMethodService
     if (_floatingKeyboardActive && _floatingKeyboardView != null) {
       ((Keyboard2View)_floatingKeyboardView).setKeyboard(current_layout());
     }
+    if (_secondaryKeyboardActive && _secondaryFloatingKeyboardView != null) {
+      ((Keyboard2View)_secondaryFloatingKeyboardView).setKeyboard(current_layout());
+    }
   }
 
   void setSpecialLayout(KeyboardData l)
@@ -142,6 +160,9 @@ public class FloatingKeyboard2 extends InputMethodService
     _currentSpecialLayout = l;
     if (_floatingKeyboardActive && _floatingKeyboardView != null) {
       ((Keyboard2View)_floatingKeyboardView).setKeyboard(l);
+    }
+    if (_secondaryKeyboardActive && _secondaryFloatingKeyboardView != null) {
+      ((Keyboard2View)_secondaryFloatingKeyboardView).setKeyboard(l);
     }
   }
 
@@ -974,6 +995,157 @@ public class FloatingKeyboard2 extends InputMethodService
     }
   }
 
+  /**
+   * bd-6aacf2 (v60): the first non-default display that is powered ON, or null.
+   * Used to mirror a second floating keyboard onto the other half of a dual-screen
+   * device (e.g. the Surface Duo). Returns null on a normal single-display phone.
+   */
+  private android.view.Display findSecondaryDisplay() {
+    if (android.os.Build.VERSION.SDK_INT < 30)
+      return null;
+    try {
+      android.hardware.display.DisplayManager dm =
+          (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
+      if (dm == null)
+        return null;
+      for (android.view.Display d : dm.getDisplays()) {
+        if (d.getDisplayId() != android.view.Display.DEFAULT_DISPLAY
+            && d.getState() == android.view.Display.STATE_ON) {
+          return d;
+        }
+      }
+    } catch (Throwable t) {
+      Logs.log("FloatingKeyboard2", "findSecondaryDisplay failed: " + t);
+    }
+    return null;
+  }
+
+  /**
+   * bd-6aacf2 (v60): log the full display topology (count + each display's id,
+   * name, state, real size, flags) at keyboard-create time. This is the decisive
+   * on-device diagnostic for the Duo span problem: it distinguishes "two separate
+   * displays" (=> mirrored per-screen keyboards, this build) from "one logical
+   * spanned display" (=> a width-spanning fix is needed instead). One capture of
+   * this line pins the exact topology if v60 does not fully land.
+   */
+  private void logDisplayTopology() {
+    try {
+      android.hardware.display.DisplayManager dm =
+          (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
+      if (dm == null) {
+        Logs.log("FloatingKeyboard2", "display topology: DisplayManager null");
+        return;
+      }
+      android.view.Display[] ds = dm.getDisplays();
+      StringBuilder sb = new StringBuilder("display topology: count=" + ds.length);
+      for (android.view.Display d : ds) {
+        android.graphics.Point p = new android.graphics.Point();
+        try { d.getRealSize(p); } catch (Throwable ignore) {}
+        sb.append(" [id=").append(d.getDisplayId())
+          .append(" name=").append(d.getName())
+          .append(" state=").append(d.getState())
+          .append(" size=").append(p.x).append("x").append(p.y)
+          .append(" flags=0x").append(Integer.toHexString(d.getFlags()))
+          .append("]");
+      }
+      Logs.log("FloatingKeyboard2", sb.toString());
+    } catch (Throwable t) {
+      Logs.log("FloatingKeyboard2", "logDisplayTopology failed: " + t);
+    }
+  }
+
+  /**
+   * bd-6aacf2 (v60): create a mirrored floating keyboard on the secondary display
+   * so a dual-screen device (Surface Duo) has a usable keyboard on BOTH halves. A
+   * fixed-position plain container (not the draggable ResizableFloatingContainer,
+   * whose drag/resize handlers act on the primary window's fields) is used, so the
+   * secondary keyboard is a stationary mirror for now. Fully guarded: any failure
+   * leaves the primary keyboard untouched. No-op when there is no secondary display.
+   */
+  private void createSecondaryFloatingKeyboard() {
+    if (android.os.Build.VERSION.SDK_INT < 30)
+      return;
+    android.view.Display secondary = findSecondaryDisplay();
+    if (secondary == null) {
+      Logs.log("FloatingKeyboard2", "no secondary display; single-screen keyboard only");
+      return;
+    }
+    try {
+      android.content.Context dctx = createDisplayContext(secondary)
+          .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null);
+      WindowManager wm = (WindowManager) dctx.getSystemService(WINDOW_SERVICE);
+      if (wm == null) {
+        Logs.log("FloatingKeyboard2", "secondary display WM null; skipping mirror");
+        return;
+      }
+      _secondaryOverlayWindowContext = dctx;
+      _secondaryWindowManager = wm;
+
+      View kbView = View.inflate(
+          new android.view.ContextThemeWrapper(dctx, _config.theme), R.layout.keyboard, null);
+      ((Keyboard2View)kbView).setKeyboard(current_layout());
+      ((Keyboard2View)kbView).reset();
+      ((Keyboard2View)kbView).setEnabled(true);
+      ((Keyboard2View)kbView).setClickable(true);
+      ((Keyboard2View)kbView).setFocusable(true);
+
+      FrameLayout container = new FrameLayout(dctx);
+      FrameLayout.LayoutParams kbParams = new FrameLayout.LayoutParams(
+          FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+      kbParams.gravity = Gravity.TOP | Gravity.LEFT;
+      container.addView(kbView, kbParams);
+
+      int windowFlags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+          | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+          | WindowManager.LayoutParams.FLAG_SPLIT_TOUCH;
+      WindowManager.LayoutParams params = new WindowManager.LayoutParams(
+          WindowManager.LayoutParams.WRAP_CONTENT,
+          WindowManager.LayoutParams.WRAP_CONTENT,
+          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+          windowFlags,
+          PixelFormat.TRANSLUCENT);
+      params.gravity = Gravity.TOP | Gravity.LEFT;
+      params.x = 100;
+      params.y = 300;
+
+      wm.addView(container, params);
+      _secondaryFloatingKeyboardView = kbView;
+      _secondaryFloatingContainer = container;
+      _secondaryFloatingLayoutParams = params;
+      _secondaryKeyboardActive = true;
+      Logs.log("FloatingKeyboard2", "secondary floating keyboard added on display "
+          + secondary.getDisplayId() + " (" + secondary.getName() + ")");
+    } catch (Throwable t) {
+      Logs.log("FloatingKeyboard2", "failed to create secondary floating keyboard: " + t);
+      _secondaryFloatingKeyboardView = null;
+      _secondaryFloatingContainer = null;
+      _secondaryFloatingLayoutParams = null;
+      _secondaryOverlayWindowContext = null;
+      _secondaryWindowManager = null;
+      _secondaryKeyboardActive = false;
+    }
+  }
+
+  /** bd-6aacf2 (v60): tear down the mirrored secondary floating keyboard. */
+  private void removeSecondaryFloatingKeyboard() {
+    if (_secondaryFloatingContainer != null && _secondaryWindowManager != null) {
+      try {
+        _secondaryWindowManager.removeView(_secondaryFloatingContainer);
+      } catch (Throwable t) {
+        Logs.log("FloatingKeyboard2", "failed to remove secondary floating keyboard: " + t);
+      }
+    }
+    if (_secondaryFloatingKeyboardView instanceof Keyboard2View) {
+      try { ((Keyboard2View)_secondaryFloatingKeyboardView).reset(); } catch (Throwable ignore) {}
+    }
+    _secondaryKeyboardActive = false;
+    _secondaryFloatingKeyboardView = null;
+    _secondaryFloatingContainer = null;
+    _secondaryFloatingLayoutParams = null;
+    _secondaryOverlayWindowContext = null;
+    _secondaryWindowManager = null;
+  }
+
   private android.graphics.Point getFullDisplaySize() {
     android.graphics.Point size = new android.graphics.Point();
     // bd-6aacf2 (v59, Harry: "just like one big screen"): return the TRUE spanned
@@ -1121,6 +1293,10 @@ public class FloatingKeyboard2 extends InputMethodService
       // Update the keyboard view with new layout
       ((Keyboard2View)_floatingKeyboardView).setKeyboard(current_layout());
       ((Keyboard2View)_floatingKeyboardView).reset();
+      if (_secondaryKeyboardActive && _secondaryFloatingKeyboardView instanceof Keyboard2View) {
+        ((Keyboard2View)_secondaryFloatingKeyboardView).setKeyboard(current_layout());
+        ((Keyboard2View)_secondaryFloatingKeyboardView).reset();
+      }
       
       // Request layout update
       if (_floatingContainer != null) {
@@ -1170,6 +1346,9 @@ public class FloatingKeyboard2 extends InputMethodService
     // Clear any stale visual mode feedback when creating new keyboard
     clearFloatingModeVisuals();
     android.util.Log.d("FloatingKeyboard", "Cleared visual mode feedback during keyboard creation");
+
+    // bd-6aacf2 (v60): decisive on-device diagnostic for the Duo span problem.
+    logDisplayTopology();
     
     try {
       // Create floating keyboard view with pass-through background
@@ -1260,6 +1439,11 @@ public class FloatingKeyboard2 extends InputMethodService
       container.setWindowManager(_windowManager, params);
       
       _floatingKeyboardActive = true;
+
+      // bd-6aacf2 (v60): also mirror a keyboard onto the second screen of a
+      // dual-screen device so both halves are usable. No-op on single-display
+      // phones; fully guarded so a failure never affects the primary keyboard.
+      createSecondaryFloatingKeyboard();
       
       
     } catch (Exception e) {
@@ -1270,6 +1454,9 @@ public class FloatingKeyboard2 extends InputMethodService
   private void removeFloatingKeyboard() {
     if (_floatingKeyboardActive && _floatingContainer != null) {
       try {
+        // bd-6aacf2 (v60): tear down the mirrored secondary-display keyboard too.
+        removeSecondaryFloatingKeyboard();
+
         // Clean up toggle button window if it exists
         removeToggleButtonWindow();
         
