@@ -967,31 +967,54 @@ public class FloatingKeyboard2 extends InputMethodService
    * the service WindowManager on API < 30 or on any error.
    */
   private WindowManager createOverlayWindowManager() {
-    WindowManager fallback = (WindowManager) getSystemService(WINDOW_SERVICE);
+    WindowManager serviceWm = (WindowManager) getSystemService(WINDOW_SERVICE);
     if (android.os.Build.VERSION.SDK_INT < 30)
-      return fallback;
+      return serviceWm;
     try {
+      int serviceW = 0, serviceH = 0;
+      try {
+        android.graphics.Rect sb = serviceWm.getMaximumWindowMetrics().getBounds();
+        serviceW = sb.width(); serviceH = sb.height();
+      } catch (Throwable ignore) {}
+
       android.hardware.display.DisplayManager dm =
           (android.hardware.display.DisplayManager) getSystemService(DISPLAY_SERVICE);
       android.view.Display display = (dm != null)
           ? dm.getDisplay(android.view.Display.DEFAULT_DISPLAY) : null;
-      if (display == null)
-        return fallback;
-      _overlayWindowContext = createDisplayContext(display)
-          .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null);
-      WindowManager wm =
-          (WindowManager) _overlayWindowContext.getSystemService(WINDOW_SERVICE);
-      if (wm == null)
-        return fallback;
-      try {
-        android.graphics.Rect b = wm.getMaximumWindowMetrics().getBounds();
-        Logs.log("FloatingKeyboard2", "overlay window-context WM ready, max bounds "
-            + b.width() + "x" + b.height());
-      } catch (Throwable ignore) {}
-      return wm;
+      int ctxW = 0, ctxH = 0;
+      WindowManager ctxWm = null;
+      android.content.Context wctx = null;
+      if (display != null) {
+        wctx = createDisplayContext(display)
+            .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null);
+        ctxWm = (WindowManager) wctx.getSystemService(WINDOW_SERVICE);
+        if (ctxWm != null) {
+          try {
+            android.graphics.Rect cb = ctxWm.getMaximumWindowMetrics().getBounds();
+            ctxW = cb.width(); ctxH = cb.height();
+          } catch (Throwable ignore) {}
+        }
+      }
+      Logs.log("FloatingKeyboard2", "overlay WM candidates: service=" + serviceW + "x" + serviceH
+          + " windowContext=" + ctxW + "x" + ctxH);
+      // bd-6aacf2 (v61): the overlay must attach to the WindowManager that can span
+      // the WHOLE logical display. Harry's on-Duo log proved the Surface Duo is ONE
+      // display that grows 1350 -> 2784 when spanned, but the display-aware
+      // createWindowContext WM stays CLAMPED to one screen (1350) while the base
+      // service context sees the full 2784 (getResources). v57's window-context
+      // attachment was therefore the invisible wall: the overlay window could never
+      // exceed one screen. Attach to whichever WM reports the wider bounds; on a
+      // normal single-screen phone both agree, so behaviour is unchanged.
+      if (ctxWm != null && ctxW > serviceW) {
+        _overlayWindowContext = wctx;
+        return ctxWm;
+      }
+      _overlayWindowContext = null; // use the base service context for inflate + add
+      return serviceWm;
     } catch (Throwable t) {
-      Logs.log("FloatingKeyboard2", "window-context WM unavailable, using service WM: " + t);
-      return fallback;
+      Logs.log("FloatingKeyboard2", "createOverlayWindowManager failed, using service WM: " + t);
+      _overlayWindowContext = null;
+      return serviceWm;
     }
   }
 
@@ -1349,6 +1372,12 @@ public class FloatingKeyboard2 extends InputMethodService
 
     // bd-6aacf2 (v60): decisive on-device diagnostic for the Duo span problem.
     logDisplayTopology();
+    // bd-6aacf2 (v61): re-acquire the overlay WindowManager each time the keyboard
+    // is (re)created so it reflects the CURRENT display bounds. onConfigurationChanged
+    // recreates the keyboard when the Duo spans (1350 -> 2784), but the WM was cached
+    // at onCreate (pre-span 1350), so the window was re-added to a stale one-screen
+    // WM -- the invisible wall. Refreshing it lets the window span the full display.
+    _windowManager = createOverlayWindowManager();
     
     try {
       // Create floating keyboard view with pass-through background
@@ -1383,7 +1412,11 @@ public class FloatingKeyboard2 extends InputMethodService
       
       // Set up window parameters for overlay - enable pass-through for gaps
       int windowFlags = WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL | 
-                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
+                        // bd-6aacf2 (v61): let the window extend across the full
+                        // spanned display (both Duo halves) instead of being
+                        // clipped to one screen's content area.
+                        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
       
       // Try to enable split-touch for better gap handling
       if (VERSION.SDK_INT >= 11) {

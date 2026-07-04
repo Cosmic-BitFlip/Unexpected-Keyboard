@@ -17,8 +17,8 @@ android {
     applicationId "com.harryaskham.omni"
     minSdk 21
     targetSdkVersion 35
-    versionCode 60
-    versionName "1.33.4"
+    versionCode 61
+    versionName "1.33.5"
   }
 
   sourceSets {
