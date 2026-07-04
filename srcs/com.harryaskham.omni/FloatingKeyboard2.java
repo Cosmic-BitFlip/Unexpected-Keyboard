@@ -108,6 +108,11 @@ public class FloatingKeyboard2 extends InputMethodService
   private ViewGroup _secondaryFloatingContainer;
   private WindowManager.LayoutParams _secondaryFloatingLayoutParams;
   private boolean _secondaryKeyboardActive = false;
+  // bd-6aacf2 (v62): true when the display is currently spanned (the bare service
+  // WM sees a wider span than the one-screen display-window-context WM, e.g. a
+  // Surface Duo unfolded to 2784). Drives the panel-2 paint probe. False on a
+  // normal single-screen phone / folded Duo, so their behaviour is untouched.
+  private boolean _displaySpanned = false;
   
   // Separate window for toggle button to remain touchable in passthrough mode
   private View _toggleButtonWindow;
@@ -997,6 +1002,10 @@ public class FloatingKeyboard2 extends InputMethodService
       }
       Logs.log("FloatingKeyboard2", "overlay WM candidates: service=" + serviceW + "x" + serviceH
           + " windowContext=" + ctxW + "x" + ctxH);
+      // bd-6aacf2 (v62): spanned when the base service context sees a wider bound
+      // than the one-screen window context (e.g. Duo unfolded). Normal phones:
+      // both equal -> not spanned.
+      _displaySpanned = (ctxW > 0 && serviceW > ctxW);
       // bd-6aacf2 (v61): the overlay must attach to the WindowManager that can span
       // the WHOLE logical display. Harry's on-Duo log proved the Surface Duo is ONE
       // display that grows 1350 -> 2784 when spanned, but the display-aware
@@ -1149,7 +1158,7 @@ public class FloatingKeyboard2 extends InputMethodService
     }
   }
 
-  /** bd-6aacf2 (v60): tear down the mirrored secondary floating keyboard. */
+  /** bd-6aacf2 (v62): tear down the mirrored secondary floating keyboard. */
   private void removeSecondaryFloatingKeyboard() {
     if (_secondaryFloatingContainer != null && _secondaryWindowManager != null) {
       try {
@@ -1167,6 +1176,51 @@ public class FloatingKeyboard2 extends InputMethodService
     _secondaryFloatingLayoutParams = null;
     _secondaryOverlayWindowContext = null;
     _secondaryWindowManager = null;
+  }
+
+  /**
+   * bd-6aacf2 (v62): DIAGNOSTIC panel-2 paint probe. Makes the host window
+   * full-span (x=0, full width/height, NO_LIMITS), non-touchable so all touches
+   * pass through (the keyboard is not typeable while this probe is active -- it is
+   * a look-only diagnostic), tints the host faintly so its extent is visible
+   * across both panels, and parks the keyboard content on panel 2 (~60% across).
+   * If the keyboard / tint paints on the second panel, overlay surfaces DO
+   * composite across the hinge and the full-span-host rework is worthwhile; if the
+   * second panel stays blank, SurfaceFlinger clips overlays to panel 0 and a
+   * different approach is needed. Only runs while spanned; single-screen / folded
+   * is untouched.
+   */
+  private void applyPanel2PaintProbe() {
+    try {
+      android.graphics.Point full = getFullDisplaySize();
+      if (_floatingLayoutParams == null || _floatingContainer == null)
+        return;
+      _floatingLayoutParams.x = 0;
+      _floatingLayoutParams.y = 0;
+      _floatingLayoutParams.width = full.x;
+      _floatingLayoutParams.height = full.y;
+      _floatingLayoutParams.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+          | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS;
+      // faint green tint so the host's full extent is visible on both panels
+      _floatingContainer.setBackgroundColor(0x2200FF00);
+      int marginLeft = (int) (full.x * 0.60f);
+      int marginTop = full.y / 3;
+      if (_floatingKeyboardView != null
+          && _floatingKeyboardView.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+        FrameLayout.LayoutParams lp =
+            (FrameLayout.LayoutParams) _floatingKeyboardView.getLayoutParams();
+        lp.leftMargin = marginLeft;
+        lp.topMargin = marginTop;
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+        _floatingKeyboardView.setLayoutParams(lp);
+      }
+      _windowManager.updateViewLayout(_floatingContainer, _floatingLayoutParams);
+      Logs.log("FloatingKeyboard2", "PROBE panel-2 paint: full-span host " + full.x + "x" + full.y
+          + " NOT_TOUCHABLE tinted, keyboard parked at marginLeft=" + marginLeft
+          + " top=" + marginTop + " -- diagnostic: does it paint on panel 2?");
+    } catch (Throwable t) {
+      Logs.log("FloatingKeyboard2", "panel-2 paint probe failed: " + t);
+    }
   }
 
   private android.graphics.Point getFullDisplaySize() {
@@ -1251,6 +1305,12 @@ public class FloatingKeyboard2 extends InputMethodService
 
   private void clampKeyboardPositionToScreen() {
     if (_floatingLayoutParams == null || _floatingContainer == null) {
+      return;
+    }
+    // bd-6aacf2 (v62): the panel-2 paint probe owns the layout while spanned
+    // (full-span host + parked keyboard); don't let the normal clamp fight it.
+    if (_displaySpanned) {
+      Logs.log("FloatingKeyboard2", "clamp skipped: panel-2 paint probe active");
       return;
     }
 
@@ -1477,6 +1537,17 @@ public class FloatingKeyboard2 extends InputMethodService
       // dual-screen device so both halves are usable. No-op on single-display
       // phones; fully guarded so a failure never affects the primary keyboard.
       createSecondaryFloatingKeyboard();
+
+      // bd-6aacf2 (v62): panel-2 paint PROBE (diagnostic). When the display is
+      // spanned, reconfigure the host window to full-span + non-touchable and park
+      // the keyboard squarely on panel 2, to answer the one open question the v61
+      // log could not: can a TYPE_APPLICATION_OVERLAY surface actually composite on
+      // the Duo's second panel across the hinge? If it paints, the full drag-model
+      // rework (full-span host + inner draggable keyboard) is worth doing; if panel
+      // 2 stays blank, overlays can't composite there and that rework is futile.
+      if (_displaySpanned) {
+        applyPanel2PaintProbe();
+      }
       
       
     } catch (Exception e) {
